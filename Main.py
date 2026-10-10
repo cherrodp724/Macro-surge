@@ -214,3 +214,110 @@ if not matching_tranches.empty:
         f"🎯 Target Auction Date: **{target_auction_date}** ($T+0$). Searching window using Fallback checking to prevent market holidays."
     )
     
+    issue_dates_found = ", ".join(matching_tranches["issue_date"].unique())
+    st.caption(f"Tranche Amount: ${matching_tranches['offering_b'].sum():,.1f}B | Terms: {', '.join(matching_tranches['security_term'].unique())} | Issue Date(s): {issue_dates_found}")
+
+    if st.button("Run T-1 & T+0 Settlement Scan"):
+        # Determine target date datetime
+        t_0_dt = datetime.datetime.strptime(target_auction_date, "%Y-%m-%d").date()
+        while t_0_dt.weekday() >= 5:
+            t_0_dt -= datetime.timedelta(days=1)
+            
+        t_0_str = str(t_0_dt)
+        
+        # ACTIVE BACKTRACKING FOR T+0: In case the Auction Date falls on a holiday
+        df_t0 = pd.DataFrame()
+        with st.spinner("Evaluating and verifying active session on Auction Date..."):
+            for _ in range(5): 
+                t0_data = fetch_raw_day_data(t_0_str, api_key_input)
+                if t0_data:
+                    df_t0 = pd.DataFrame(t0_data)
+                    break
+                else:
+                    st.caption(f"⚠️ {t_0_str} was closed / inactive (possible holiday). Searching previous session...")
+                    t_0_dt -= datetime.timedelta(days=1)
+                    while t_0_dt.weekday() >= 5:
+                        t_0_dt -= datetime.timedelta(days=1)
+                    t_0_str = str(t_0_dt)
+                    time.sleep(0.5)
+
+        # ACTIVE BACKTRACKING FOR T-1: Ensure we get a valid trading day prior to T0
+        df_t1 = pd.DataFrame()
+        if not df_t0.empty:
+            t_minus_1_dt = t_0_dt - datetime.timedelta(days=1)
+            while t_minus_1_dt.weekday() >= 5:
+                t_minus_1_dt -= datetime.timedelta(days=1)
+                
+            t_minus_1_str = str(t_minus_1_dt)
+            
+            with st.spinner(f"Verifying active trading day prior to {t_0_str}..."):
+                for _ in range(5):
+                    t1_data = fetch_raw_day_data(t_minus_1_str, api_key_input)
+                    if t1_data:
+                        df_t1 = pd.DataFrame(t1_data)
+                        break
+                    else:
+                        st.caption(f"⚠️ {t_minus_1_str} was closed / inactive (possible holiday). Searching previous session...")
+                        t_minus_1_dt -= datetime.timedelta(days=1)
+                        while t_minus_1_dt.weekday() >= 5:
+                            t_minus_1_dt -= datetime.timedelta(days=1)
+                        t_minus_1_str = str(t_minus_1_dt)
+                        time.sleep(0.5)
+                        
+        if df_t0.empty or df_t1.empty:
+            st.error("No active trading sessions found within a 5-day window of those dates. Please verify your API key is correct.")
+        else:
+            # Lookback business sessions dynamically from the verified Baseline Lookback Parameter
+            lookback_days = get_historical_trading_days(t_minus_1_dt, lookback=baseline_lookback)
+            
+            with st.spinner(f"Evaluating {baseline_lookback}-day lookback session baseline..."):
+                df_base = build_smoothed_baseline(lookback_days, api_key_input)
+                
+            if df_base.empty:
+                st.error("Historical baseline could not be generated. Polygon/Massive requests may be failing on the current lookback. Wait 1 min and try again.")
+            else:
+                # Standardize & Merge
+                df_t1 = df_t1[['ticker', 'volume', 'close']].rename(columns={'volume': 'vol_T1', 'close': 'close_T1'})
+                df_t0 = df_t0[['ticker', 'volume', 'close']].rename(columns={'volume': 'vol_T0', 'close': 'close_T0'})
+                
+                merged = pd.merge(df_t1, df_t0, on="ticker", how="inner")
+                merged = pd.merge(merged, df_base, on="ticker", how="inner")
+                
+                # Minimum baseline liquidity gate
+                merged = merged[merged["avg_volume_10d"] >= 500_000].copy()
+                
+                # Calculate Independent RVOL based on the dynamic Base Days
+                merged["rvol_T1"] = merged["vol_T1"] / merged["avg_volume_10d"]
+                merged["rvol_T0"] = merged["vol_T0"] / merged["avg_volume_10d"]
+                
+                # Filter gateway (at least one day meeting requirements)
+                merged = merged[(merged["rvol_T1"] >= min_rvol_input) | (merged["rvol_T0"] >= min_rvol_input)].copy()
+                
+                # Target flag validation
+                merged["double_surge"] = (merged["rvol_T1"] >= min_rvol_input) & (merged["rvol_T0"] >= min_rvol_input)
+                
+                # Generate composites & scores
+                merged["base_score"] = np.log10(merged["vol_T1"] + merged["vol_T0"]) * (merged["rvol_T1"] + merged["rvol_T0"])
+                merged["surge_score"] = np.where(merged["double_surge"], merged["base_score"] * 2.0, merged["base_score"])
+                
+                results = merged.sort_values(by="surge_score", ascending=False).reset_index(drop=True)
+                
+                st.subheader(f"Results for Verified Windows: {t_minus_1_str} ($T-1$) & {t_0_str} ($T+0$)")
+                if not results.empty:
+                    out = results.head(25).copy()
+                    
+                    out["Type"] = np.where(out["double_surge"], "🔥 DOUBLE SURGE", "Single Spike")
+                    out["vol_T1"] = out["vol_T1"].apply(lambda x: f"{x:,.0f}")
+                    out["vol_T0"] = out["vol_T0"].apply(lambda x: f"{x:,.0f}")
+                    out["avg_vol"] = out["avg_volume_10d"].apply(lambda x: f"{x:,.0f}")
+                    out["rvol_T1"] = out["rvol_T1"].apply(lambda x: f"{x:.2f}x")
+                    out["rvol_T0"] = out["rvol_T0"].apply(lambda x: f"{x:.2f}x")
+                    out["surge_score"] = out["surge_score"].apply(lambda x: f"{x:.2f}")
+                    out["close_T0"] = out["close_T0"].apply(lambda x: f"${x:.2f}")
+                    
+                    st.dataframe(
+                        out[["ticker", "Type", "close_T0", "avg_vol", "vol_T1", "rvol_T1", "vol_T0", "rvol_T0", "surge_score"]],
+                        use_container_width=True
+                    )
+                else:
+                    st.info("No tickers exceeded the surge criteria across this window.")
