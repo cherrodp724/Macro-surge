@@ -35,11 +35,12 @@ with st.sidebar:
     st.header("2. Scanner Parameters")
     min_tranche = st.slider("Min Cumulative Maturity ($B)", 50, 250, 100, step=25)
     min_rvol_input = st.slider("Min RVOL Threshold", 1.5, 10.0, 2.0, step=0.5)
+    min_market_cap = st.slider("Min Market Cap ($M)", 50, 2000, 250, step=50)
     
     baseline_lookback = st.slider(
         "Baseline Lookback Days", 
         3, 10, 5, 
-        help="Free tiers allow 5 req/min. Use 3-5 days for fast scans. Use 10 days for deeper baseline (will trigger the 65s pause)."
+        help="Free tiers allow 5 req/min. Use 3-5 days for fast scans. Use 10 days for deeper baseline."
     )
     
     today = datetime.date.today()
@@ -91,8 +92,51 @@ def fetch_treasury_maturities(start_date, end_date, min_size_billions=100):
     return filtered_df
 
 # -------------------------------------------------------------
-# 2. Market Data Helpers & Resilient Rate-Limit Management
+# 2. Market Data Helpers, ETF Filters & Market Cap Validator
 # -------------------------------------------------------------
+@st.cache_data(ttl=604800)
+def get_common_stocks():
+    """Fetches the official consolidated market tape to strip out ETFs and Warrants."""
+    try:
+        url = "http://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqtraded.txt"
+        df = pd.read_csv(url, sep='|')
+        df = df[:-1] 
+        valid_df = df[(df['ETF'] == 'N') & (df['Test Issue'] == 'N')]
+        return set(valid_df['Symbol'].dropna().tolist())
+    except Exception:
+        return set()
+
+@st.cache_data(ttl=3600)
+def get_market_cap_valid_tickers(ticker_tuple, min_cap_m):
+    """Hits Yahoo Finance bulk API to filter out micro-caps without burning Polygon limits."""
+    if not ticker_tuple: return []
+    valid_tickers = set()
+    chunk_size = 200 
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'}
+    
+    for i in range(0, len(ticker_tuple), chunk_size):
+        chunk = ticker_tuple[i:i+chunk_size]
+        sym_str = ",".join(chunk)
+        url = f"https://query2.finance.yahoo.com/v7/finance/quote?symbols={sym_str}"
+        
+        try:
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                for item in data.get("quoteResponse", {}).get("result", []):
+                    ticker = item.get("symbol")
+                    cap = item.get("marketCap", 0)
+                    # Convert minimum millions to actual integer
+                    if cap >= (min_cap_m * 1_000_000):
+                        valid_tickers.add(ticker)
+            else:
+                # Fallback: if Yahoo blocks the request, let tickers through rather than crashing the app
+                valid_tickers.update(chunk)
+        except Exception:
+            valid_tickers.update(chunk)
+            
+    return list(valid_tickers)
+
 def get_historical_trading_days(target_date, lookback=10):
     days = []
     curr = target_date - datetime.timedelta(days=1)
@@ -106,6 +150,7 @@ def get_historical_trading_days(target_date, lookback=10):
 def fetch_raw_day_data(d_str, api_key):
     url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{d_str}?adjusted=true&apiKey={api_key}"
     retries = 2
+    valid_stocks = get_common_stocks()
     
     for attempt in range(retries):
         try:
@@ -114,9 +159,7 @@ def fetch_raw_day_data(d_str, api_key):
             if res.status_code == 429:
                 status_box = st.empty()
                 for sec in range(65, 0, -1):
-                    status_box.warning(
-                        f"⏳ **Paytience...** API limit reached. Countdown to next batch of results: **{sec}s**"
-                    )
+                    status_box.warning(f"⏳ **Paytience...** API limit reached. Countdown to next batch of results: **{sec}s**")
                     time.sleep(1)
                 status_box.empty()
                 continue
@@ -138,7 +181,11 @@ def fetch_raw_day_data(d_str, api_key):
                 vol = r.get("v", 0)
                 close = r.get("c", 0)
                 ticker = r.get("T", "")
-                if vol >= 500_000 and (vol * close) >= 20_000_000 and len(ticker) <= 5 and "." not in ticker:
+                
+                if valid_stocks and ticker not in valid_stocks:
+                    continue
+                    
+                if vol >= 500_000 and close >= 5.0 and (vol * close) >= 20_000_000 and len(ticker) <= 5 and "." not in ticker:
                     rows.append({
                         "ticker": ticker,
                         "close": close,
@@ -174,7 +221,7 @@ def build_smoothed_baseline(trading_days, api_key):
 # 3. Main Interface & Execution
 # -------------------------------------------------------------
 st.title("Macro Collateral & Volume Surge Scanner")
-st.caption("Detecting institutional accumulation around $100B+ Treasury maturities using smoothed multi-day RVOL math.")
+st.caption("Detecting institutional accumulation around $100B+ Treasury maturities using smoothed multi-day RVOL math. Filtered strictly for Common Optionable Equities.")
 
 if not api_key_input:
     st.warning("Enter your Massive/Polygon API Key in the sidebar to begin.")
@@ -217,7 +264,6 @@ if not matching_tranches.empty:
     
     if st.button("Run T-1 & T+0 Settlement Scan for All Auctions"):
         
-        # MASTER LIST TO TRACK RECURRING LEADERS
         master_auction_results = []
         
         for target_auction_date in unique_auction_dates:
@@ -234,7 +280,6 @@ if not matching_tranches.empty:
                 
             t_0_str = str(t_0_dt)
             
-            # ACTIVE BACKTRACKING FOR T+0
             df_t0 = pd.DataFrame()
             with st.spinner(f"[{target_auction_date}] Verifying active session on Auction Date..."):
                 for _ in range(5): 
@@ -250,7 +295,6 @@ if not matching_tranches.empty:
                         t_0_str = str(t_0_dt)
                         time.sleep(0.5)
 
-            # ACTIVE BACKTRACKING FOR T-1
             df_t1 = pd.DataFrame()
             if not df_t0.empty:
                 t_minus_1_dt = t_0_dt - datetime.timedelta(days=1)
@@ -298,6 +342,15 @@ if not matching_tranches.empty:
             merged["rvol_T0"] = merged["vol_T0"] / merged["avg_volume_10d"]
             
             merged = merged[(merged["rvol_T1"] >= min_rvol_input) | (merged["rvol_T0"] >= min_rvol_input)].copy()
+            
+            # --- MARKET CAP FILTER (Only checks the specific tickers that passed the RVOL gate) ---
+            if not merged.empty:
+                with st.spinner(f"[{target_auction_date}] Verifying >= ${min_market_cap}M Market Cap..."):
+                    candidate_tickers = tuple(merged["ticker"].tolist())
+                    valid_mc_tickers = get_market_cap_valid_tickers(candidate_tickers, min_market_cap)
+                    merged = merged[merged["ticker"].isin(valid_mc_tickers)].copy()
+            # --------------------------------------------------------------------------------------
+            
             merged["double_surge"] = (merged["rvol_T1"] >= min_rvol_input) & (merged["rvol_T0"] >= min_rvol_input)
             
             merged["base_score"] = np.log10(merged["vol_T1"] + merged["vol_T0"]) * (merged["rvol_T1"] + merged["rvol_T0"])
@@ -305,7 +358,6 @@ if not matching_tranches.empty:
             
             results = merged.sort_values(by="surge_score", ascending=False).reset_index(drop=True)
             
-            # Store passing tickers for the final aggregate leaderboard
             if not results.empty:
                 store_df = results.copy()
                 store_df["auction_date"] = target_auction_date
@@ -329,10 +381,10 @@ if not matching_tranches.empty:
                     use_container_width=True
                 )
             else:
-                st.info(f"No tickers exceeded the surge criteria across the {target_auction_date} window.")
+                st.info(f"No optionable stocks >= ${min_market_cap}M cap exceeded the surge criteria across the {target_auction_date} window.")
                 
         # ---------------------------------------------------------
-        # AGGREGATE RECURRING LEADERS (Cross-Auction Comparison)
+        # AGGREGATE RECURRING LEADERS
         # ---------------------------------------------------------
         if len(unique_auction_dates) > 1 and master_auction_results:
             st.markdown("---")
@@ -350,11 +402,9 @@ if not matching_tranches.empty:
                 Total_Surge_Vol=("total_event_vol", "sum")
             ).reset_index()
             
-            # Filter to only those that appeared in more than one distinct auction
             recurring_leaders = leaderboard[leaderboard["Appearances"] > 1].copy()
             
             if not recurring_leaders.empty:
-                # Rank by appearance consistency first, then by the mathematical score
                 recurring_leaders = recurring_leaders.sort_values(by=["Appearances", "Avg_Score"], ascending=[False, False])
                 
                 recurring_leaders["Avg_RVOL_T1"] = recurring_leaders["Avg_RVOL_T1"].apply(lambda x: f"{x:.2f}x")
