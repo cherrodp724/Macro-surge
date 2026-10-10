@@ -96,7 +96,7 @@ def fetch_raw_day_data(d_str, api_key):
     try:
         res = requests.get(url, timeout=15)
         
-        # Handle 429 Too Many Requests
+        # Handle API Rate-limiting
         if res.status_code == 429:
             status_box = st.empty()
             for sec in range(60, 0, -1):
@@ -105,37 +105,48 @@ def fetch_raw_day_data(d_str, api_key):
             status_box.empty()
             res = requests.get(url, timeout=15)
 
+        # Catch unauthorized keys explicitly
+        if res.status_code in [401, 403]:
+            st.error(f"❌ Authorization Error (HTTP {res.status_code}). Verify your Polygon/Massive API key is entered correctly.")
+            return []
+
+        if res.status_code != 200:
+            return []
+
         data = res.json()
         results = data.get("results", [])
-        if results:
-            rows = []
-            for r in results:
-                vol = r.get("v", 0)
-                close = r.get("c", 0)
-                ticker = r.get("T", "")
-                # Institutional liquidity gate: eliminates warrants, units, and sub-penny noise
-                if vol >= 500_000 and (vol * close) >= 20_000_000 and len(ticker) <= 5 and "." not in ticker:
-                    rows.append({
-                        "ticker": ticker,
-                        "close": close,
-                        "volume": vol,
-                        "dollar_volume": vol * close
-                    })
-            return rows
-    except Exception:
-        pass
-    return []
+        if not results:
+            return []  # Return empty for weekends/holidays (Polygons return empty on non-trading days)
+
+        rows = []
+        for r in results:
+            vol = r.get("v", 0)
+            close = r.get("c", 0)
+            ticker = r.get("T", "")
+            # Institutional liquidity filter
+            if vol >= 500_000 and (vol * close) >= 20_000_000 and len(ticker) <= 5 and "." not in ticker:
+                rows.append({
+                    "ticker": ticker,
+                    "close": close,
+                    "volume": vol,
+                    "dollar_volume": vol * close
+                })
+        return rows
+    except Exception as e:
+        st.warning(f"Connection issue fetching {d_str}: {e}")
+        return []
 
 def build_smoothed_baseline(trading_days, api_key):
-    """Averages volume per ticker across the full 10-session lookback window."""
+    """Averages volume per ticker across the lookback sessions."""
     dfs = []
-    pbar = st.progress(0, text="Building 10-Day Volume Baseline...")
+    pbar = st.progress(0, text="Building Baseline...")
     
     for idx, d in enumerate(trading_days):
         day_records = fetch_raw_day_data(d, api_key)
-        if day_records:
+        if day_records and isinstance(day_records, list):
             dfs.append(pd.DataFrame(day_records))
-        pbar.progress((idx + 1) / len(trading_days), text=f"Processing session {d}...")
+        pbar.progress((idx + 1) / len(trading_days), text=f"Processing Session {d}...")
+        time.sleep(0.1) # Small throttle
         
     pbar.empty()
     if not dfs:
@@ -154,7 +165,7 @@ if not api_key_input:
     st.warning("Enter your Massive/Polygon API Key in the sidebar to begin.")
     st.stop()
 
-# Step A: Table of Maturing Tranches (CUSIP, dates and amounts detailed)
+# Step A: Table of Maturing Tranches
 st.subheader(f"1. Maturing Debt Schedules (>= ${min_tranche}B)")
 df_treasury = fetch_treasury_maturities(str(start_date), str(end_date), min_size_billions=min_tranche)
 
@@ -162,109 +173,137 @@ if df_treasury.empty:
     st.info("No maturity records matching that tranche threshold in this date range.")
     st.stop()
 
-# Order chronological by maturity date for visibility
 df_display = df_treasury[[
     "cusip", "security_type", "security_term", "offering_b", "auction_date", "issue_date", "maturity_date"
 ]].copy()
 
-# Format Display table
+# Format and Sort chronologically
 df_display.columns = ["CUSIP", "Security Type", "Term", "Amount ($B)", "Auction Date", "Issue Date", "Maturity Date"]
 df_display = df_display.sort_values(by="Maturity Date", ascending=False).reset_index(drop=True)
 
 st.dataframe(df_display, use_container_width=True)
 
-# Step B: Select maturity date to anchor search
+# Step B: Select maturity date to anchor scan
 st.subheader("2. Run Auction Scan via Maturity Anchor")
 target_maturity_selected = st.selectbox(
     "Select Maturing Date to Search & Trigger Auction-Day Scan",
     options=sorted(df_treasury["maturity_date"].unique(), reverse=True)
 )
 
-# Extract specific info tied to the chosen maturity anchor
 matching_tranches = df_treasury[df_treasury["maturity_date"] == target_maturity_selected].copy()
 
-# Show details of selection & calculate corresponding auction window (T+0)
 if not matching_tranches.empty:
-    # Identify the companion auction_date and check for single date
     target_auction_date = matching_tranches["auction_date"].iloc[0]
     
     st.info(
         f"⚓ Maturing Date chosen: **{target_maturity_selected}**.\n"
-        f"🎯 Scan target: **Auction Date {target_auction_date}** ($T+0$) and prior session ($T-1$) using CUSIP **{matching_tranches['cusip'].iloc[0]}** as anchor."
+        f"🎯 Target Auction Date: **{target_auction_date}** ($T+0$). Recalculating window using fallback checks if holiday is detected."
     )
     
-    # Check issue date as well
     issue_dates_found = ", ".join(matching_tranches["issue_date"].unique())
     st.caption(f"Tranche Amount: ${matching_tranches['offering_b'].sum():,.1f}B | Terms: {', '.join(matching_tranches['security_term'].unique())} | Issue Date(s): {issue_dates_found}")
 
     if st.button("Run T-1 & T+0 Settlement Scan"):
-        # Resolve dates using Auction Date (as T+0) instead of maturity date
+        # Determine target date datetime
         t_0_dt = datetime.datetime.strptime(target_auction_date, "%Y-%m-%d").date()
         while t_0_dt.weekday() >= 5:
             t_0_dt -= datetime.timedelta(days=1)
             
-        t_minus_1_str = get_historical_trading_days(t_0_dt, lookback=1)[0]
-        t_minus_1_dt = datetime.datetime.strptime(t_minus_1_str, "%Y-%m-%d").date()
         t_0_str = str(t_0_dt)
         
-        # Lookback baseline days based on day prior to start of position
-        lookback_days = get_historical_trading_days(t_minus_1_dt, lookback=10)
-        
-        with st.spinner(f"Pulling trading sessions {t_minus_1_str} ($T-1$) & {t_0_str} ($T+0$ Auction) against 10-day baseline..."):
-            df_base = build_smoothed_baseline(lookback_days, api_key_input)
-            t0_data = fetch_raw_day_data(t_0_str, api_key_input)
-            t1_data = fetch_raw_day_data(t_minus_1_str, api_key_input)
+        # ACTIVE BACKTRACKING FOR T+0: In case the Auction Date falls on a holiday
+        df_t0 = pd.DataFrame()
+        with st.spinner("Evaluating and verifying active session on Auction Date..."):
+            for _ in range(5): # Maximum of 5 backtracking tries for holiday/market close events
+                t0_data = fetch_raw_day_data(t_0_str, api_key_input)
+                if t0_data:
+                    df_t0 = pd.DataFrame(t0_data)
+                    break
+                else:
+                    st.caption(f"⚠️ {t_0_str} was closed / inactive (possible holiday). Searching previous session...")
+                    t_0_dt -= datetime.timedelta(days=1)
+                    while t_0_dt.weekday() >= 5:
+                        t_0_dt -= datetime.timedelta(days=1)
+                    t_0_str = str(t_0_dt)
+                    time.sleep(0.5)
 
-            df_t0 = pd.DataFrame(t0_data) if t0_data else pd.DataFrame()
-            df_t1 = pd.DataFrame(t1_data) if t1_data else pd.DataFrame()
+        # ACTIVE BACKTRACKING FOR T-1: Ensure we get a valid trading day prior to T0
+        df_t1 = pd.DataFrame()
+        if not df_t0.empty:
+            t_minus_1_dt = t_0_dt - datetime.timedelta(days=1)
+            while t_minus_1_dt.weekday() >= 5:
+                t_minus_1_dt -= datetime.timedelta(days=1)
+                
+            t_minus_1_str = str(t_minus_1_dt)
             
-        if df_t0.empty or df_t1.empty or df_base.empty:
-            st.warning("Incomplete market bars returned. Verify that both dates were active trading sessions.")
+            with st.spinner(f"Verifying active trading on day prior..."):
+                for _ in range(5):
+                    t1_data = fetch_raw_day_data(t_minus_1_str, api_key_input)
+                    if t1_data:
+                        df_t1 = pd.DataFrame(t1_data)
+                        break
+                    else:
+                        st.caption(f"⚠️ {t_minus_1_str} was closed / inactive (possible holiday). Searching previous session...")
+                        t_minus_1_dt -= datetime.timedelta(days=1)
+                        while t_minus_1_dt.weekday() >= 5:
+                            t_minus_1_dt -= datetime.timedelta(days=1)
+                        t_minus_1_str = str(t_minus_1_dt)
+                        time.sleep(0.5)
+                        
+        if df_t0.empty or df_t1.empty:
+            st.error("No active trading sessions found within a 5-day window of those dates. Please verify your API key is correct.")
         else:
-            # Standardize and merge
-            df_t1 = df_t1[['ticker', 'volume', 'close']].rename(columns={'volume': 'vol_T1', 'close': 'close_T1'})
-            df_t0 = df_t0[['ticker', 'volume', 'close']].rename(columns={'volume': 'vol_T0', 'close': 'close_T0'})
+            # Lookback 10 business sessions starting from our verified T-1
+            lookback_days = get_historical_trading_days(t_minus_1_dt, lookback=10)
             
-            merged = pd.merge(df_t1, df_t0, on="ticker", how="inner")
-            merged = pd.merge(merged, df_base, on="ticker", how="inner")
-            
-            # Use institutional liquidity floor
-            merged = merged[merged["avg_volume_10d"] >= 500_000].copy()
-            
-            # Calculate Independent RVOL for T-1 (Pre-Auction) and T+0 (Auction Day)
-            merged["rvol_T1"] = merged["vol_T1"] / merged["avg_volume_10d"]
-            merged["rvol_T0"] = merged["vol_T0"] / merged["avg_volume_10d"]
-            
-            # Filter: At least one day must meet the target rvol multiple
-            merged = merged[(merged["rvol_T1"] >= min_rvol_input) | (merged["rvol_T0"] >= min_rvol_input)].copy()
-            
-            # Double Surge Qualifier
-            merged["double_surge"] = (merged["rvol_T1"] >= min_rvol_input) & (merged["rvol_T0"] >= min_rvol_input)
-            
-            # Compute score (Aggregated Rel Vol * Size Log)
-            merged["base_score"] = np.log10(merged["vol_T1"] + merged["vol_T0"]) * (merged["rvol_T1"] + merged["rvol_T0"])
-            
-            # 2.0x Double Surge Multiplier
-            merged["surge_score"] = np.where(merged["double_surge"], merged["base_score"] * 2.0, merged["base_score"])
-            
-            results = merged.sort_values(by="surge_score", ascending=False).reset_index(drop=True)
-            
-            st.subheader(f"Results for Pre-Auction & Auction Windows: {t_minus_1_str} & {t_0_str}")
-            if not results.empty:
-                out = results.head(25).copy()
+            with st.spinner(f"Evaluating 10-day lookback session baseline..."):
+                df_base = build_smoothed_baseline(lookback_days, api_key_input)
                 
-                out["Type"] = np.where(out["double_surge"], "🔥 DOUBLE SURGE", "Single Spike")
-                out["vol_T1"] = out["vol_T1"].apply(lambda x: f"{x:,.0f}")
-                out["vol_T0"] = out["vol_T0"].apply(lambda x: f"{x:,.0f}")
-                out["avg_vol"] = out["avg_volume_10d"].apply(lambda x: f"{x:,.0f}")
-                out["rvol_T1"] = out["rvol_T1"].apply(lambda x: f"{x:.2f}x")
-                out["rvol_T0"] = out["rvol_T0"].apply(lambda x: f"{x:.2f}x")
-                out["surge_score"] = out["surge_score"].apply(lambda x: f"{x:.2f}")
-                out["close_T0"] = out["close_T0"].apply(lambda x: f"${x:.2f}")
-                
-                st.dataframe(
-                    out[["ticker", "Type", "close_T0", "avg_vol", "vol_T1", "rvol_T1", "vol_T0", "rvol_T0", "surge_score"]],
-                    use_container_width=True
-                )
+            if df_base.empty:
+                st.error("Historical baseline could not be generated. Polygon requests may be failing on the current lookback. Wait 1 min and try again.")
             else:
-                st.info("No tickers exceeded the surge threshold across this window.")
+                # Standardize & Merge
+                df_t1 = df_t1[['ticker', 'volume', 'close']].rename(columns={'volume': 'vol_T1', 'close': 'close_T1'})
+                df_t0 = df_t0[['ticker', 'volume', 'close']].rename(columns={'volume': 'vol_T0', 'close': 'close_T0'})
+                
+                merged = pd.merge(df_t1, df_t0, on="ticker", how="inner")
+                merged = pd.merge(merged, df_base, on="ticker", how="inner")
+                
+                # Minimum baseline liquidity gate
+                merged = merged[merged["avg_volume_10d"] >= 500_000].copy()
+                
+                # Calculate Independent RVOL
+                merged["rvol_T1"] = merged["vol_T1"] / merged["avg_volume_10d"]
+                merged["rvol_T0"] = merged["vol_T0"] / merged["avg_volume_10d"]
+                
+                # Filter gateway (at least one day meeting requirements)
+                merged = merged[(merged["rvol_T1"] >= min_rvol_input) | (merged["rvol_T0"] >= min_rvol_input)].copy()
+                
+                # Target flag validation
+                merged["double_surge"] = (merged["rvol_T1"] >= min_rvol_input) & (merged["rvol_T0"] >= min_rvol_input)
+                
+                # Generate composites & scores
+                merged["base_score"] = np.log10(merged["vol_T1"] + merged["vol_T0"]) * (merged["rvol_T1"] + merged["rvol_T0"])
+                merged["surge_score"] = np.where(merged["double_surge"], merged["base_score"] * 2.0, merged["base_score"])
+                
+                results = merged.sort_values(by="surge_score", ascending=False).reset_index(drop=True)
+                
+                st.subheader(f"Results for Verified Windows: {t_minus_1_str} ($T-1$) & {t_0_str} ($T+0$)")
+                if not results.empty:
+                    out = results.head(25).copy()
+                    
+                    out["Type"] = np.where(out["double_surge"], "🔥 DOUBLE SURGE", "Single Spike")
+                    out["vol_T1"] = out["vol_T1"].apply(lambda x: f"{x:,.0f}")
+                    out["vol_T0"] = out["vol_T0"].apply(lambda x: f"{x:,.0f}")
+                    out["avg_vol"] = out["avg_volume_10d"].apply(lambda x: f"{x:,.0f}")
+                    out["rvol_T1"] = out["rvol_T1"].apply(lambda x: f"{x:.2f}x")
+                    out["rvol_T0"] = out["rvol_T0"].apply(lambda x: f"{x:.2f}x")
+                    out["surge_score"] = out["surge_score"].apply(lambda x: f"{x:.2f}")
+                    out["close_T0"] = out["close_T0"].apply(lambda x: f"${x:.2f}")
+                    
+                    st.dataframe(
+                        out[["ticker", "Type", "close_T0", "avg_vol", "vol_T1", "rvol_T1", "vol_T0", "rvol_T0", "surge_score"]],
+                        use_container_width=True
+                    )
+                else:
+                    st.info("No tickers exceeded the surge criteria across this window.")
