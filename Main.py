@@ -36,6 +36,13 @@ with st.sidebar:
     min_tranche = st.slider("Min Maturity Tranche ($B)", 50, 250, 100, step=25)
     min_rvol_input = st.slider("Min RVOL Threshold", 1.5, 10.0, 2.0, step=0.5)
     
+    # NEW lookback selector to bypass 429 limits
+    baseline_lookback = st.slider(
+        "Baseline Lookback Days", 
+        3, 10, 5, 
+        help="Free tiers allow 5 req/min. Use 3-5 days to scan without 429 rate limit delays. Use 10 days for paid tiers."
+    )
+    
     today = datetime.date.today()
     start_date = st.date_input("Start Maturity Window", today - datetime.timedelta(days=30))
     end_date = st.date_input("End Maturity Window", today)
@@ -91,7 +98,7 @@ def get_historical_trading_days(target_date, lookback=10):
 
 @st.cache_data(ttl=86400)
 def fetch_raw_day_data(d_str, api_key):
-    """Pulls grouped daily bars and waits 60s if the 5 req/min quota is tripped."""
+    """Pulls grouped daily bars and waits 65s if the 5 req/min quota is tripped."""
     url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{d_str}?adjusted=true&apiKey={api_key}"
     try:
         res = requests.get(url, timeout=15)
@@ -99,8 +106,12 @@ def fetch_raw_day_data(d_str, api_key):
         # Handle API Rate-limiting
         if res.status_code == 429:
             status_box = st.empty()
-            for sec in range(60, 0, -1):
-                status_box.warning(f"API rate limit (5/min) reached. Cooling down: {sec}s remaining...")
+            for sec in range(65, 0, -1):
+                status_box.warning(
+                    f"⚠️ Massive Free Tier limit (5 req/min) hit on {d_str}! "
+                    f"Resting {sec}s for the sliding-minute window to reset... "
+                    "To avoid this delay entirely, drop 'Baseline Lookback Days' to 3 or 5 in the sidebar."
+                )
                 time.sleep(1)
             status_box.empty()
             res = requests.get(url, timeout=15)
@@ -116,7 +127,7 @@ def fetch_raw_day_data(d_str, api_key):
         data = res.json()
         results = data.get("results", [])
         if not results:
-            return []  # Return empty for weekends/holidays (Polygons return empty on non-trading days)
+            return []  # Return empty for weekends/holidays
 
         rows = []
         for r in results:
@@ -146,7 +157,7 @@ def build_smoothed_baseline(trading_days, api_key):
         if day_records and isinstance(day_records, list):
             dfs.append(pd.DataFrame(day_records))
         pbar.progress((idx + 1) / len(trading_days), text=f"Processing Session {d}...")
-        time.sleep(0.1) # Small throttle
+        time.sleep(0.5)  # Pace requests slightly to respect un-cached runs
         
     pbar.empty()
     if not dfs:
@@ -159,7 +170,7 @@ def build_smoothed_baseline(trading_days, api_key):
 # 3. Main Interface & Execution
 # -------------------------------------------------------------
 st.title("Macro Collateral & Volume Surge Scanner")
-st.caption("Detecting institutional accumulation around $100B+ Treasury maturities using 10-day smoothed 48-hour RVOL math.")
+st.caption("Detecting institutional accumulation around $100B+ Treasury maturities using smoothed multi-day RVOL math.")
 
 if not api_key_input:
     st.warning("Enter your Massive/Polygon API Key in the sidebar to begin.")
@@ -197,7 +208,7 @@ if not matching_tranches.empty:
     
     st.info(
         f"⚓ Maturing Date chosen: **{target_maturity_selected}**.\n"
-        f"🎯 Target Auction Date: **{target_auction_date}** ($T+0$). Recalculating window using fallback checks if holiday is detected."
+        f"🎯 Target Auction Date: **{target_auction_date}** ($T+0$). Searching window using Fallback checking to prevent market holidays."
     )
     
     issue_dates_found = ", ".join(matching_tranches["issue_date"].unique())
@@ -236,7 +247,7 @@ if not matching_tranches.empty:
                 
             t_minus_1_str = str(t_minus_1_dt)
             
-            with st.spinner(f"Verifying active trading on day prior..."):
+            with st.spinner(f"Verifying active trading day prior to {t_0_str}..."):
                 for _ in range(5):
                     t1_data = fetch_raw_day_data(t_minus_1_str, api_key_input)
                     if t1_data:
@@ -253,14 +264,14 @@ if not matching_tranches.empty:
         if df_t0.empty or df_t1.empty:
             st.error("No active trading sessions found within a 5-day window of those dates. Please verify your API key is correct.")
         else:
-            # Lookback 10 business sessions starting from our verified T-1
-            lookback_days = get_historical_trading_days(t_minus_1_dt, lookback=10)
+            # Lookback business sessions dynamically from the verified Baseline Lookback Parameter
+            lookback_days = get_historical_trading_days(t_minus_1_dt, lookback=baseline_lookback)
             
-            with st.spinner(f"Evaluating 10-day lookback session baseline..."):
+            with st.spinner(f"Evaluating {baseline_lookback}-day lookback session baseline..."):
                 df_base = build_smoothed_baseline(lookback_days, api_key_input)
                 
             if df_base.empty:
-                st.error("Historical baseline could not be generated. Polygon requests may be failing on the current lookback. Wait 1 min and try again.")
+                st.error("Historical baseline could not be generated. Polygon/Massive requests may be failing on the current lookback. Wait 1 min and try again.")
             else:
                 # Standardize & Merge
                 df_t1 = df_t1[['ticker', 'volume', 'close']].rename(columns={'volume': 'vol_T1', 'close': 'close_T1'})
@@ -272,7 +283,7 @@ if not matching_tranches.empty:
                 # Minimum baseline liquidity gate
                 merged = merged[merged["avg_volume_10d"] >= 500_000].copy()
                 
-                # Calculate Independent RVOL
+                # Calculate Independent RVOL based on the dynamic Base Days
                 merged["rvol_T1"] = merged["vol_T1"] / merged["avg_volume_10d"]
                 merged["rvol_T0"] = merged["vol_T0"] / merged["avg_volume_10d"]
                 
