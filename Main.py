@@ -1,13 +1,12 @@
 import datetime
 import os
 import time
-import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
 st.set_page_config(
-    page_title="Macro Collateral & Surge Scanner",
+    page_title="Macro Collateral & Volume Scanner",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -34,16 +33,10 @@ with st.sidebar:
     
     st.header("2. Scanner Parameters")
     min_tranche = st.slider("Min Cumulative Maturity ($B)", 50, 250, 100, step=25)
-    
-    # RVOL slider bumped back up to target true anomalies
-    min_rvol_input = st.slider("Min RVOL Threshold", 1.5, 10.0, 2.5, step=0.5)
     min_market_cap = st.slider("Min Market Cap ($M)", 50, 2000, 250, step=50)
     
-    baseline_lookback = st.slider(
-        "Baseline Volume (Past Sessions)", 
-        3, 14, 8, 
-        help="Averages the raw volume over the specified number of trading sessions immediately prior to T+0."
-    )
+    # NEW: Dynamic Price Slider (Defaulting to $70)
+    min_price_input = st.slider("Min Stock Price ($)", 5.0, 300.0, 70.0, step=5.0)
     
     today = datetime.date.today()
     start_date = st.date_input("Start Maturity Window", today - datetime.timedelta(days=30))
@@ -137,18 +130,8 @@ def get_market_cap_valid_tickers(ticker_tuple, min_cap_m):
             
     return list(valid_tickers)
 
-def get_historical_trading_days(target_date, lookback=8):
-    """Returns business sessions strictly prior to target_date."""
-    days = []
-    curr = target_date - datetime.timedelta(days=1)
-    while len(days) < lookback:
-        if curr.weekday() < 5:
-            days.append(curr.strftime("%Y-%m-%d"))
-        curr -= datetime.timedelta(days=1)
-    return days
-
 @st.cache_data(ttl=86400)
-def fetch_raw_day_data(d_str, api_key):
+def fetch_raw_day_data(d_str, api_key, min_price):
     """Fetches the entire US equity market for a given date in one call."""
     url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{d_str}?adjusted=true&apiKey={api_key}"
     retries = 2
@@ -184,15 +167,16 @@ def fetch_raw_day_data(d_str, api_key):
                 close = r.get("c", 0)
                 ticker = r.get("T", "")
                 
+                # Strip out ETFs/Warrants
                 if valid_stocks and ticker not in valid_stocks:
                     continue
                     
-                if close >= 5.0 and len(ticker) <= 5 and "." not in ticker:
+                # Strict floor filter for premium institutional viability
+                if close >= min_price and len(ticker) <= 5 and "." not in ticker:
                     rows.append({
                         "ticker": ticker,
                         "close": close,
-                        "volume": vol,
-                        "dollar_volume": vol * close
+                        "volume": vol
                     })
             return rows
             
@@ -201,29 +185,11 @@ def fetch_raw_day_data(d_str, api_key):
             
     return []
 
-def build_smoothed_baseline(trading_days, api_key):
-    dfs = []
-    pbar = st.progress(0, text="Building Baseline...")
-    
-    for idx, d in enumerate(trading_days):
-        day_records = fetch_raw_day_data(d, api_key)
-        if day_records and isinstance(day_records, list):
-            dfs.append(pd.DataFrame(day_records))
-        pbar.progress((idx + 1) / len(trading_days), text=f"Processing Baseline Session {d}...")
-        time.sleep(0.5)  
-        
-    pbar.empty()
-    if not dfs:
-        return pd.DataFrame()
-
-    full_history = pd.concat(dfs, ignore_index=True)
-    return full_history.groupby("ticker")["volume"].mean().reset_index(name="avg_session_vol")
-
 # -------------------------------------------------------------
 # 3. Main Interface & Execution
 # -------------------------------------------------------------
-st.title("Macro Collateral & Extreme Volume Anomaly Scanner")
-st.caption("Scans the entire US market for extreme relative volume (RVOL) explosions on T+0 (Auction) and T+1 (Settlement), filtering for optionable candidates >= $250M Market Cap.")
+st.title("Macro Collateral & Top Volume Leaders Scanner")
+st.caption("Isolates the absolute Top 50 highest-volume premium equities on T+0 (Auction) and T+1 (Settlement).")
 
 if not api_key_input:
     st.warning("Enter your Massive/Polygon API Key in the sidebar to begin.")
@@ -262,7 +228,7 @@ if not matching_tranches.empty:
         f"🎯 Found **{len(unique_auction_dates)}** associated Auction Date(s): {', '.join(unique_auction_dates)}."
     )
     
-    if st.button("Run Market-Wide Anomaly Scan for All Auctions"):
+    if st.button("Run Top 50 Volume Scan for All Auctions"):
         
         master_auction_results = []
         
@@ -284,7 +250,7 @@ if not matching_tranches.empty:
             df_t0 = pd.DataFrame()
             with st.spinner(f"[{target_auction_date}] Fetching entire US market for T0 Auction Date..."):
                 for _ in range(5): 
-                    t0_data = fetch_raw_day_data(t_0_str, api_key_input)
+                    t0_data = fetch_raw_day_data(t_0_str, api_key_input, min_price_input)
                     if t0_data:
                         df_t0 = pd.DataFrame(t0_data)
                         break
@@ -311,7 +277,7 @@ if not matching_tranches.empty:
                 
                 with st.spinner(f"[{target_auction_date}] Fetching entire US market for post-auction session ($T+1$: {t_plus_1_str})..."):
                     for _ in range(5):
-                        t1_data = fetch_raw_day_data(t_plus_1_str, api_key_input)
+                        t1_data = fetch_raw_day_data(t_plus_1_str, api_key_input, min_price_input)
                         if t1_data:
                             df_t1 = pd.DataFrame(t1_data)
                             break
@@ -330,71 +296,43 @@ if not matching_tranches.empty:
             df_t0 = df_t0[['ticker', 'volume', 'close']].rename(columns={'volume': 'vol_T0', 'close': 'close_T0'})
             df_t1 = df_t1[['ticker', 'volume', 'close']].rename(columns={'volume': 'vol_T1', 'close': 'close_T1'})
             
-            # --- 3. FETCH WHOLE MARKET BASELINE ---
-            lookback_days = get_historical_trading_days(t_0_dt, lookback=baseline_lookback)
-            
-            with st.spinner(f"[{target_auction_date}] Evaluating {baseline_lookback}-session whole-market average volume..."):
-                df_base = build_smoothed_baseline(lookback_days, api_key_input)
-                
-            if df_base.empty:
-                st.error(f"Historical baseline could not be generated for {target_auction_date}.")
-                continue
-                
-            # --- 4. MERGE DATA & CALCULATE MARKET-WIDE RVOL ---
+            # --- 3. MERGE DATA & CALCULATE TOTAL VOLUME ---
             merged = pd.merge(df_t0, df_t1, on="ticker", how="inner")
-            merged_final = pd.merge(merged, df_base, on="ticker", how="inner")
+            merged["total_event_vol"] = merged["vol_T0"] + merged["vol_T1"]
             
-            # Strict optionable liquidity gate: baseline MUST be at least 500k shares avg
-            merged_final = merged_final[merged_final["avg_session_vol"] >= 500_000].copy()
+            # --- 4. ISOLATE THE ABSOLUTE TOP 50 LEADERS ---
+            top_50 = merged.sort_values(by="total_event_vol", ascending=False).head(50).copy()
             
-            merged_final["rvol_T0"] = merged_final["vol_T0"] / merged_final["avg_session_vol"]
-            merged_final["rvol_T1"] = merged_final["vol_T1"] / merged_final["avg_session_vol"]
-            
-            # --- 5. ISOLATE EXTREME ANOMALIES ---
-            merged_final = merged_final[(merged_final["rvol_T0"] >= min_rvol_input) | (merged_final["rvol_T1"] >= min_rvol_input)].copy()
-            merged_final["double_surge"] = (merged_final["rvol_T0"] >= min_rvol_input) & (merged_final["rvol_T1"] >= min_rvol_input)
-            
-            # Score heavily rewards stocks that have massive relative spikes across both days
-            merged_final["base_score"] = (merged_final["rvol_T0"] + merged_final["rvol_T1"]) * np.log10(merged_final["vol_T0"] + merged_final["vol_T1"])
-            merged_final["surge_score"] = np.where(merged_final["double_surge"], merged_final["base_score"] * 2.0, merged_final["base_score"])
-            
-            # Grab top 50 absolute craziest anomalies to verify market cap
-            top_anomalies = merged_final.sort_values(by="surge_score", ascending=False).head(50)
-            
-            if top_anomalies.empty:
-                st.info(f"No stocks exceeded the RVOL surge criteria during the {target_auction_date} window.")
+            if top_50.empty:
+                st.info(f"No volume leaders found during the {target_auction_date} window.")
                 continue
                 
-            # --- 6. VERIFY MARKET CAP ON THE ANOMALIES ---
-            with st.spinner(f"[{target_auction_date}] Verifying >= ${min_market_cap}M Market Cap on Volume Anomalies..."):
-                candidate_tickers = tuple(top_anomalies["ticker"].tolist())
+            # --- 5. VERIFY MARKET CAP ON THE TOP 50 ---
+            with st.spinner(f"[{target_auction_date}] Verifying >= ${min_market_cap}M Market Cap on Volume Leaders..."):
+                candidate_tickers = tuple(top_50["ticker"].tolist())
                 valid_mc_tickers = get_market_cap_valid_tickers(candidate_tickers, min_market_cap)
-                final_results = top_anomalies[top_anomalies["ticker"].isin(valid_mc_tickers)].head(25).copy()
+                final_results = top_50[top_50["ticker"].isin(valid_mc_tickers)].copy()
             
             if not final_results.empty:
                 store_df = final_results.copy()
                 store_df["auction_date"] = target_auction_date
                 master_auction_results.append(store_df)
             
-            st.write(f"**Top Volume Anomalies Passing Market Cap: {t_0_str} ($T0$ Auction) & {t_plus_1_str} ($T+1$ Post-Auction)**")
+            st.write(f"**Top Volume Leaders Passing Market Cap (>= ${min_price_input}): {t_0_str} ($T0$) & {t_plus_1_str} ($T+1$)**")
             if not final_results.empty:
                 out = final_results.copy()
                 
-                out["Type"] = np.where(out["double_surge"], "🔥 DOUBLE SURGE", "Single Spike")
                 out["vol_T0"] = out["vol_T0"].apply(lambda x: f"{x:,.0f}")
                 out["vol_T1"] = out["vol_T1"].apply(lambda x: f"{x:,.0f}")
-                out["avg_session_vol"] = out["avg_session_vol"].apply(lambda x: f"{x:,.0f}")
-                out["rvol_T0"] = out["rvol_T0"].apply(lambda x: f"{x:.2f}x")
-                out["rvol_T1"] = out["rvol_T1"].apply(lambda x: f"{x:.2f}x")
-                out["surge_score"] = out["surge_score"].apply(lambda x: f"{x:.2f}")
+                out["total_event_vol_str"] = out["total_event_vol"].apply(lambda x: f"{x:,.0f}")
                 out["close_T1"] = out["close_T1"].apply(lambda x: f"${x:.2f}")
                 
                 st.dataframe(
-                    out[["ticker", "Type", "close_T1", "avg_session_vol", "vol_T0", "rvol_T0", "vol_T1", "rvol_T1", "surge_score"]],
+                    out[["ticker", "close_T1", "vol_T0", "vol_T1", "total_event_vol_str"]].rename(columns={"total_event_vol_str": "Total Event Vol"}),
                     use_container_width=True
                 )
             else:
-                st.info(f"No anomalies passed the >= ${min_market_cap}M Market Cap threshold.")
+                st.info(f"No leaders passed the >= ${min_market_cap}M Market Cap threshold.")
                 
         # ---------------------------------------------------------
         # AGGREGATE RECURRING LEADERS
@@ -402,29 +340,27 @@ if not matching_tranches.empty:
         if len(unique_auction_dates) > 1 and master_auction_results:
             st.markdown("---")
             st.header("🏆 Multi-Auction Recurring Volume Leaders")
-            st.caption("Stocks exhibiting consistent elevated RVOL across multiple distinct auction openings/reopenings for this maturity.")
+            st.caption("Stocks exhibiting consistent dominant volume across multiple distinct auction openings/reopenings for this maturity.")
             
             agg_df = pd.concat(master_auction_results, ignore_index=True)
-            agg_df["total_event_vol"] = agg_df["vol_T0"] + agg_df["vol_T1"]
             
             leaderboard = agg_df.groupby("ticker").agg(
                 Appearances=("ticker", "count"),
-                Avg_RVOL_T0=("rvol_T0", "mean"),
-                Avg_RVOL_T1=("rvol_T1", "mean"),
-                Avg_Score=("surge_score", "mean"),
-                Total_Surge_Vol=("total_event_vol", "sum")
+                Avg_Vol_T0=("vol_T0", "mean"),
+                Avg_Vol_T1=("vol_T1", "mean"),
+                Total_Auction_Vol=("total_event_vol", "sum")
             ).reset_index()
             
             recurring_leaders = leaderboard[leaderboard["Appearances"] > 1].copy()
             
             if not recurring_leaders.empty:
-                recurring_leaders = recurring_leaders.sort_values(by=["Appearances", "Avg_Score"], ascending=[False, False])
+                # Rank by appearances first, then total accumulated volume across all events
+                recurring_leaders = recurring_leaders.sort_values(by=["Appearances", "Total_Auction_Vol"], ascending=[False, False])
                 
-                recurring_leaders["Avg_RVOL_T0"] = recurring_leaders["Avg_RVOL_T0"].apply(lambda x: f"{x:.2f}x")
-                recurring_leaders["Avg_RVOL_T1"] = recurring_leaders["Avg_RVOL_T1"].apply(lambda x: f"{x:.2f}x")
-                recurring_leaders["Avg_Score"] = recurring_leaders["Avg_Score"].apply(lambda x: f"{x:.2f}")
-                recurring_leaders["Total_Surge_Vol"] = recurring_leaders["Total_Surge_Vol"].apply(lambda x: f"{x:,.0f}")
+                recurring_leaders["Avg_Vol_T0"] = recurring_leaders["Avg_Vol_T0"].apply(lambda x: f"{x:,.0f}")
+                recurring_leaders["Avg_Vol_T1"] = recurring_leaders["Avg_Vol_T1"].apply(lambda x: f"{x:,.0f}")
+                recurring_leaders["Total_Auction_Vol"] = recurring_leaders["Total_Auction_Vol"].apply(lambda x: f"{x:,.0f}")
                 
                 st.dataframe(recurring_leaders, use_container_width=True)
             else:
-                st.info("No single ticker managed to clear the minimum accumulation threshold across multiple different auction dates.")
+                st.info("No single ticker managed to stay in the Top 50 volume leaders across multiple different auction dates.")
