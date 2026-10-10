@@ -13,7 +13,7 @@ st.set_page_config(
 )
 
 # -------------------------------------------------------------
-# API Configuration (Streamlit Secrets, Env Vars, or Sidebar)
+# API Configuration
 # -------------------------------------------------------------
 default_key = ""
 if "POLYGON_API_KEY" in st.secrets:
@@ -47,14 +47,14 @@ with st.sidebar:
     end_date = st.date_input("End Maturity Window", today)
 
 # -------------------------------------------------------------
-# 1. Fetch Treasury Maturing Tranches (Aggregated Openings + Reopenings)
+# 1. Fetch Treasury Maturing Tranches (Aggregated)
 # -------------------------------------------------------------
 @st.cache_data(ttl=3600)
 def fetch_treasury_maturities(start_date, end_date, min_size_billions=100):
     url = (
         f"https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/od/auctions_query"
         f"?filter=maturity_date:gte:{start_date},maturity_date:lte:{end_date}"
-        f"&page[size]=5000"  # Increased page size to capture all micro-auctions
+        f"&page[size]=5000"
     )
     try:
         res = requests.get(url, timeout=15).json()
@@ -84,13 +84,9 @@ def fetch_treasury_maturities(start_date, end_date, min_size_billions=100):
     if df.empty:
         return df
         
-    # Group by maturity date to calculate the TRUE combined tranche size (Openings + Reopenings)
     daily_totals = df.groupby("maturity_date")["offering_b"].sum().reset_index()
-    
-    # Find which maturity dates meet your minimum threshold
     valid_dates = daily_totals[daily_totals["offering_b"] >= min_size_billions]["maturity_date"]
     
-    # Keep all individual auction events that belong to those massive maturity dates
     filtered_df = df[df["maturity_date"].isin(valid_dates)].copy()
     return filtered_df
 
@@ -98,7 +94,6 @@ def fetch_treasury_maturities(start_date, end_date, min_size_billions=100):
 # 2. Market Data Helpers & Resilient Rate-Limit Management
 # -------------------------------------------------------------
 def get_historical_trading_days(target_date, lookback=10):
-    """Generates prior business days, skipping weekends."""
     days = []
     curr = target_date - datetime.timedelta(days=1)
     while len(days) < lookback:
@@ -109,7 +104,6 @@ def get_historical_trading_days(target_date, lookback=10):
 
 @st.cache_data(ttl=86400)
 def fetch_raw_day_data(d_str, api_key):
-    """Pulls grouped daily bars with progressive rate-limit backoff and custom countdown."""
     url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{d_str}?adjusted=true&apiKey={api_key}"
     retries = 2
     
@@ -117,7 +111,6 @@ def fetch_raw_day_data(d_str, api_key):
         try:
             res = requests.get(url, timeout=15)
             
-            # Catch 429 Rate Limit - Trigger 'Paytience' Countdown
             if res.status_code == 429:
                 status_box = st.empty()
                 for sec in range(65, 0, -1):
@@ -160,7 +153,6 @@ def fetch_raw_day_data(d_str, api_key):
     return []
 
 def build_smoothed_baseline(trading_days, api_key):
-    """Averages volume per ticker across the dynamic lookback sessions."""
     dfs = []
     pbar = st.progress(0, text="Building Baseline...")
     
@@ -200,7 +192,6 @@ df_display = df_treasury[[
     "cusip", "security_type", "security_term", "offering_b", "auction_date", "issue_date", "maturity_date"
 ]].copy()
 
-# Format and Sort chronologically
 df_display.columns = ["CUSIP", "Security Type", "Term", "Amount ($B)", "Auction Date", "Issue Date", "Maturity Date"]
 df_display = df_display.sort_values(by=["Maturity Date", "Auction Date"], ascending=[False, True]).reset_index(drop=True)
 
@@ -216,7 +207,6 @@ target_maturity_selected = st.selectbox(
 matching_tranches = df_treasury[df_treasury["maturity_date"] == target_maturity_selected].copy()
 
 if not matching_tranches.empty:
-    # Identify ALL unique auction dates (Opening and Reopenings) associated with this maturity date
     unique_auction_dates = sorted(matching_tranches["auction_date"].dropna().unique())
     total_liquidity = matching_tranches['offering_b'].sum()
     
@@ -226,15 +216,15 @@ if not matching_tranches.empty:
     )
     
     if st.button("Run T-1 & T+0 Settlement Scan for All Auctions"):
-        # Iterate over every unique auction date found for this tranche
+        
+        # MASTER LIST TO TRACK RECURRING LEADERS
+        master_auction_results = []
+        
         for target_auction_date in unique_auction_dates:
             st.markdown("---")
             st.subheader(f"🏦 Scanning Auction Event: {target_auction_date}")
             
-            # Determine target date datetime
             t_0_dt = datetime.datetime.strptime(target_auction_date, "%Y-%m-%d").date()
-            
-            # Check if auction is in the future
             if t_0_dt > datetime.date.today():
                 st.warning(f"Auction date {target_auction_date} is in the future. Skipping market data pull.")
                 continue
@@ -253,7 +243,7 @@ if not matching_tranches.empty:
                         df_t0 = pd.DataFrame(t0_data)
                         break
                     else:
-                        st.caption(f"⚠️ {t_0_str} was closed (possible holiday). Searching previous session...")
+                        st.caption(f"⚠️ {t_0_str} was closed. Searching previous session...")
                         t_0_dt -= datetime.timedelta(days=1)
                         while t_0_dt.weekday() >= 5:
                             t_0_dt -= datetime.timedelta(days=1)
@@ -287,7 +277,6 @@ if not matching_tranches.empty:
                 st.error(f"No active trading sessions found within a 5-day window of {target_auction_date}. Skipping.")
                 continue
                 
-            # Lookback baseline
             lookback_days = get_historical_trading_days(t_minus_1_dt, lookback=baseline_lookback)
             
             with st.spinner(f"[{target_auction_date}] Evaluating {baseline_lookback}-day lookback session baseline..."):
@@ -297,7 +286,6 @@ if not matching_tranches.empty:
                 st.error(f"Historical baseline could not be generated for {target_auction_date}.")
                 continue
                 
-            # Merge and Calculate
             df_t1 = df_t1[['ticker', 'volume', 'close']].rename(columns={'volume': 'vol_T1', 'close': 'close_T1'})
             df_t0 = df_t0[['ticker', 'volume', 'close']].rename(columns={'volume': 'vol_T0', 'close': 'close_T0'})
             
@@ -310,13 +298,18 @@ if not matching_tranches.empty:
             merged["rvol_T0"] = merged["vol_T0"] / merged["avg_volume_10d"]
             
             merged = merged[(merged["rvol_T1"] >= min_rvol_input) | (merged["rvol_T0"] >= min_rvol_input)].copy()
-            
             merged["double_surge"] = (merged["rvol_T1"] >= min_rvol_input) & (merged["rvol_T0"] >= min_rvol_input)
             
             merged["base_score"] = np.log10(merged["vol_T1"] + merged["vol_T0"]) * (merged["rvol_T1"] + merged["rvol_T0"])
             merged["surge_score"] = np.where(merged["double_surge"], merged["base_score"] * 2.0, merged["base_score"])
             
             results = merged.sort_values(by="surge_score", ascending=False).reset_index(drop=True)
+            
+            # Store passing tickers for the final aggregate leaderboard
+            if not results.empty:
+                store_df = results.copy()
+                store_df["auction_date"] = target_auction_date
+                master_auction_results.append(store_df)
             
             st.write(f"**Results for Verified Windows: {t_minus_1_str} ($T-1$) & {t_0_str} ($T+0$)**")
             if not results.empty:
@@ -337,3 +330,38 @@ if not matching_tranches.empty:
                 )
             else:
                 st.info(f"No tickers exceeded the surge criteria across the {target_auction_date} window.")
+                
+        # ---------------------------------------------------------
+        # AGGREGATE RECURRING LEADERS (Cross-Auction Comparison)
+        # ---------------------------------------------------------
+        if len(unique_auction_dates) > 1 and master_auction_results:
+            st.markdown("---")
+            st.header("🏆 Multi-Auction Recurring Volume Leaders")
+            st.caption("Stocks exhibiting consistent elevated RVOL across multiple distinct auction openings/reopenings for this maturity.")
+            
+            agg_df = pd.concat(master_auction_results, ignore_index=True)
+            agg_df["total_event_vol"] = agg_df["vol_T1"] + agg_df["vol_T0"]
+            
+            leaderboard = agg_df.groupby("ticker").agg(
+                Appearances=("ticker", "count"),
+                Avg_RVOL_T1=("rvol_T1", "mean"),
+                Avg_RVOL_T0=("rvol_T0", "mean"),
+                Avg_Score=("surge_score", "mean"),
+                Total_Surge_Vol=("total_event_vol", "sum")
+            ).reset_index()
+            
+            # Filter to only those that appeared in more than one distinct auction
+            recurring_leaders = leaderboard[leaderboard["Appearances"] > 1].copy()
+            
+            if not recurring_leaders.empty:
+                # Rank by appearance consistency first, then by the mathematical score
+                recurring_leaders = recurring_leaders.sort_values(by=["Appearances", "Avg_Score"], ascending=[False, False])
+                
+                recurring_leaders["Avg_RVOL_T1"] = recurring_leaders["Avg_RVOL_T1"].apply(lambda x: f"{x:.2f}x")
+                recurring_leaders["Avg_RVOL_T0"] = recurring_leaders["Avg_RVOL_T0"].apply(lambda x: f"{x:.2f}x")
+                recurring_leaders["Avg_Score"] = recurring_leaders["Avg_Score"].apply(lambda x: f"{x:.2f}")
+                recurring_leaders["Total_Surge_Vol"] = recurring_leaders["Total_Surge_Vol"].apply(lambda x: f"{x:,.0f}")
+                
+                st.dataframe(recurring_leaders, use_container_width=True)
+            else:
+                st.info("No single ticker managed to clear the minimum accumulation threshold across multiple different auction dates.")
