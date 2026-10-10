@@ -33,7 +33,7 @@ with st.sidebar:
     )
     
     st.header("2. Scanner Parameters")
-    min_tranche = st.slider("Min Maturity Tranche ($B)", 50, 250, 100, step=25)
+    min_tranche = st.slider("Min Cumulative Maturity ($B)", 50, 250, 100, step=25)
     min_rvol_input = st.slider("Min RVOL Threshold", 1.5, 10.0, 2.0, step=0.5)
     
     baseline_lookback = st.slider(
@@ -47,15 +47,14 @@ with st.sidebar:
     end_date = st.date_input("End Maturity Window", today)
 
 # -------------------------------------------------------------
-# 1. Fetch Treasury Maturing Tranches ($100B+)
+# 1. Fetch Treasury Maturing Tranches (Aggregated Openings + Reopenings)
 # -------------------------------------------------------------
 @st.cache_data(ttl=3600)
 def fetch_treasury_maturities(start_date, end_date, min_size_billions=100):
-    min_offering_amt = min_size_billions * 1_000_000_000
     url = (
         f"https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/od/auctions_query"
         f"?filter=maturity_date:gte:{start_date},maturity_date:lte:{end_date}"
-        f"&page[size]=1000"
+        f"&page[size]=5000"  # Increased page size to capture all micro-auctions
     )
     try:
         res = requests.get(url, timeout=15).json()
@@ -68,8 +67,8 @@ def fetch_treasury_maturities(start_date, end_date, min_size_billions=100):
         offering = float(item.get("offering_amt") or 0)
         accepted = float(item.get("total_accepted") or 0)
         size = offering if offering > 0 else accepted
-
-        if size >= min_offering_amt:
+        
+        if size > 0:
             records.append({
                 "cusip": item.get("cusip"),
                 "security_type": item.get("security_type"),
@@ -80,7 +79,20 @@ def fetch_treasury_maturities(start_date, end_date, min_size_billions=100):
                 "auction_date": item.get("auction_date"),
                 "issue_date": item.get("issue_date")
             })
-    return pd.DataFrame(records)
+            
+    df = pd.DataFrame(records)
+    if df.empty:
+        return df
+        
+    # Group by maturity date to calculate the TRUE combined tranche size (Openings + Reopenings)
+    daily_totals = df.groupby("maturity_date")["offering_b"].sum().reset_index()
+    
+    # Find which maturity dates meet your minimum threshold
+    valid_dates = daily_totals[daily_totals["offering_b"] >= min_size_billions]["maturity_date"]
+    
+    # Keep all individual auction events that belong to those massive maturity dates
+    filtered_df = df[df["maturity_date"].isin(valid_dates)].copy()
+    return filtered_df
 
 # -------------------------------------------------------------
 # 2. Market Data Helpers & Resilient Rate-Limit Management
@@ -177,7 +189,7 @@ if not api_key_input:
     st.stop()
 
 # Step A: Table of Maturing Tranches
-st.subheader(f"1. Maturing Debt Schedules (>= ${min_tranche}B)")
+st.subheader(f"1. Maturing Debt Schedules (Cumulative >= ${min_tranche}B)")
 df_treasury = fetch_treasury_maturities(str(start_date), str(end_date), min_size_billions=min_tranche)
 
 if df_treasury.empty:
@@ -190,14 +202,14 @@ df_display = df_treasury[[
 
 # Format and Sort chronologically
 df_display.columns = ["CUSIP", "Security Type", "Term", "Amount ($B)", "Auction Date", "Issue Date", "Maturity Date"]
-df_display = df_display.sort_values(by="Maturity Date", ascending=False).reset_index(drop=True)
+df_display = df_display.sort_values(by=["Maturity Date", "Auction Date"], ascending=[False, True]).reset_index(drop=True)
 
 st.dataframe(df_display, use_container_width=True)
 
 # Step B: Select maturity date to anchor scan
 st.subheader("2. Run Auction Scan via Maturity Anchor")
 target_maturity_selected = st.selectbox(
-    "Select Maturing Date to Search & Trigger Auction-Day Scan",
+    "Select Maturing Date to Search & Trigger Auction-Day Scans",
     options=sorted(df_treasury["maturity_date"].unique(), reverse=True)
 )
 
@@ -205,10 +217,11 @@ matching_tranches = df_treasury[df_treasury["maturity_date"] == target_maturity_
 
 if not matching_tranches.empty:
     # Identify ALL unique auction dates (Opening and Reopenings) associated with this maturity date
-    unique_auction_dates = sorted(matching_tranches["auction_date"].unique())
+    unique_auction_dates = sorted(matching_tranches["auction_date"].dropna().unique())
+    total_liquidity = matching_tranches['offering_b'].sum()
     
     st.info(
-        f"⚓ Maturing Date chosen: **{target_maturity_selected}**.\n"
+        f"⚓ **Maturing Date:** {target_maturity_selected} | **Cumulative Size:** ${total_liquidity:,.1f}B\n\n"
         f"🎯 Found **{len(unique_auction_dates)}** associated Auction Date(s): {', '.join(unique_auction_dates)}."
     )
     
@@ -231,7 +244,7 @@ if not matching_tranches.empty:
                 
             t_0_str = str(t_0_dt)
             
-            # ACTIVE BACKTRACKING FOR T+0: In case the Auction Date falls on a holiday
+            # ACTIVE BACKTRACKING FOR T+0
             df_t0 = pd.DataFrame()
             with st.spinner(f"[{target_auction_date}] Verifying active session on Auction Date..."):
                 for _ in range(5): 
@@ -240,14 +253,14 @@ if not matching_tranches.empty:
                         df_t0 = pd.DataFrame(t0_data)
                         break
                     else:
-                        st.caption(f"⚠️ {t_0_str} was closed / inactive (possible holiday). Searching previous session...")
+                        st.caption(f"⚠️ {t_0_str} was closed (possible holiday). Searching previous session...")
                         t_0_dt -= datetime.timedelta(days=1)
                         while t_0_dt.weekday() >= 5:
                             t_0_dt -= datetime.timedelta(days=1)
                         t_0_str = str(t_0_dt)
                         time.sleep(0.5)
 
-            # ACTIVE BACKTRACKING FOR T-1: Ensure we get a valid trading day prior to T0
+            # ACTIVE BACKTRACKING FOR T-1
             df_t1 = pd.DataFrame()
             if not df_t0.empty:
                 t_minus_1_dt = t_0_dt - datetime.timedelta(days=1)
@@ -263,7 +276,7 @@ if not matching_tranches.empty:
                             df_t1 = pd.DataFrame(t1_data)
                             break
                         else:
-                            st.caption(f"⚠️ {t_minus_1_str} was closed / inactive (possible holiday). Searching previous session...")
+                            st.caption(f"⚠️ {t_minus_1_str} was closed. Searching previous session...")
                             t_minus_1_dt -= datetime.timedelta(days=1)
                             while t_minus_1_dt.weekday() >= 5:
                                 t_minus_1_dt -= datetime.timedelta(days=1)
@@ -274,7 +287,7 @@ if not matching_tranches.empty:
                 st.error(f"No active trading sessions found within a 5-day window of {target_auction_date}. Skipping.")
                 continue
                 
-            # Lookback business sessions dynamically from the verified Baseline Lookback Parameter
+            # Lookback baseline
             lookback_days = get_historical_trading_days(t_minus_1_dt, lookback=baseline_lookback)
             
             with st.spinner(f"[{target_auction_date}] Evaluating {baseline_lookback}-day lookback session baseline..."):
@@ -284,27 +297,22 @@ if not matching_tranches.empty:
                 st.error(f"Historical baseline could not be generated for {target_auction_date}.")
                 continue
                 
-            # Standardize & Merge
+            # Merge and Calculate
             df_t1 = df_t1[['ticker', 'volume', 'close']].rename(columns={'volume': 'vol_T1', 'close': 'close_T1'})
             df_t0 = df_t0[['ticker', 'volume', 'close']].rename(columns={'volume': 'vol_T0', 'close': 'close_T0'})
             
             merged = pd.merge(df_t1, df_t0, on="ticker", how="inner")
             merged = pd.merge(merged, df_base, on="ticker", how="inner")
             
-            # Minimum baseline liquidity gate
             merged = merged[merged["avg_volume_10d"] >= 500_000].copy()
             
-            # Calculate Independent RVOL based on the dynamic Base Days
             merged["rvol_T1"] = merged["vol_T1"] / merged["avg_volume_10d"]
             merged["rvol_T0"] = merged["vol_T0"] / merged["avg_volume_10d"]
             
-            # Filter gateway (at least one day meeting requirements)
             merged = merged[(merged["rvol_T1"] >= min_rvol_input) | (merged["rvol_T0"] >= min_rvol_input)].copy()
             
-            # Target flag validation
             merged["double_surge"] = (merged["rvol_T1"] >= min_rvol_input) & (merged["rvol_T0"] >= min_rvol_input)
             
-            # Generate composites & scores
             merged["base_score"] = np.log10(merged["vol_T1"] + merged["vol_T0"]) * (merged["rvol_T1"] + merged["rvol_T0"])
             merged["surge_score"] = np.where(merged["double_surge"], merged["base_score"] * 2.0, merged["base_score"])
             
