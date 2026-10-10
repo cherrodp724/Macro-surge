@@ -35,7 +35,6 @@ with st.sidebar:
     st.header("2. Scanner Parameters")
     min_tranche = st.slider("Min Cumulative Maturity ($B)", 50, 250, 100, step=25)
     min_rvol_input = st.slider("Min RVOL Threshold", 1.0, 10.0, 1.5, step=0.1)
-    min_market_cap = st.slider("Min Market Cap ($M)", 50, 2000, 250, step=50)
     
     baseline_lookback = st.slider(
         "Volume SMA Lookback (Days)", 
@@ -92,7 +91,7 @@ def fetch_treasury_maturities(start_date, end_date, min_size_billions=100):
     return filtered_df
 
 # -------------------------------------------------------------
-# 2. Market Data Helpers, ETF Filters & Market Cap Validator
+# 2. Market Data Helpers & ETF Filters 
 # -------------------------------------------------------------
 @st.cache_data(ttl=604800)
 def get_common_stocks():
@@ -105,36 +104,6 @@ def get_common_stocks():
         return set(valid_df['Symbol'].dropna().tolist())
     except Exception:
         return set()
-
-@st.cache_data(ttl=3600)
-def get_market_cap_valid_tickers(ticker_tuple, min_cap_m):
-    """Bulk-filters market cap using Yahoo Finance to avoid rate-limiting Polygon."""
-    if not ticker_tuple: 
-        return []
-    valid_tickers = set()
-    chunk_size = 200 
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    
-    for i in range(0, len(ticker_tuple), chunk_size):
-        chunk = ticker_tuple[i:i+chunk_size]
-        sym_str = ",".join(chunk)
-        url = f"https://query2.finance.yahoo.com/v7/finance/quote?symbols={sym_str}"
-        
-        try:
-            res = requests.get(url, headers=headers, timeout=10)
-            if res.status_code == 200:
-                data = res.json()
-                for item in data.get("quoteResponse", {}).get("result", []):
-                    ticker = item.get("symbol")
-                    cap = item.get("marketCap", 0)
-                    if cap >= (min_cap_m * 1_000_000):
-                        valid_tickers.add(ticker)
-            else:
-                valid_tickers.update(chunk)
-        except Exception:
-            valid_tickers.update(chunk)
-            
-    return list(valid_tickers)
 
 def get_historical_trading_days(target_date, lookback=8):
     """Returns business days strictly prior to target_date."""
@@ -185,6 +154,7 @@ def fetch_raw_day_data(d_str, api_key):
                 if valid_stocks and ticker not in valid_stocks:
                     continue
                     
+                # Strict floor filtering for options availability & structural viability
                 if vol >= 500_000 and close >= 5.0 and (vol * close) >= 20_000_000 and len(ticker) <= 5 and "." not in ticker:
                     rows.append({
                         "ticker": ticker,
@@ -279,7 +249,7 @@ if not matching_tranches.empty:
                 
             t_0_str = str(t_0_dt)
             
-            # --- 1. VERIFY T+0 SESSION (Backtrack if holiday) ---
+            # --- 1. VERIFY T+0 SESSION ---
             df_t0 = pd.DataFrame()
             with st.spinner(f"[{target_auction_date}] Verifying active session on T0 Auction Date..."):
                 for _ in range(5): 
@@ -295,7 +265,7 @@ if not matching_tranches.empty:
                         t_0_str = str(t_0_dt)
                         time.sleep(0.5)
 
-            # --- 2. VERIFY T+1 SESSION (Forward track to next active trading day) ---
+            # --- 2. VERIFY T+1 SESSION ---
             df_t1 = pd.DataFrame()
             if not df_t0.empty:
                 t_plus_1_dt = t_0_dt + datetime.timedelta(days=1)
@@ -304,9 +274,8 @@ if not matching_tranches.empty:
                     
                 t_plus_1_str = str(t_plus_1_dt)
                 
-                # Check if T+1 is in the future relative to today
                 if t_plus_1_dt > datetime.date.today():
-                    st.warning(f"Post-Auction session ($T+1$: {t_plus_1_str}) has not traded yet. Skipping.")
+                    st.warning(f"Post-Auction session ($T+1$: {t_plus_1_str}) has not closed yet. Skipping.")
                     continue
                 
                 with st.spinner(f"[{target_auction_date}] Verifying active trading on post-auction session ($T+1$: {t_plus_1_str})..."):
@@ -332,28 +301,15 @@ if not matching_tranches.empty:
             
             merged = pd.merge(df_t0, df_t1, on="ticker", how="inner")
             
-            # --- 3. IDENTIFY TOP VOLUME LEADERS ACROSS T0 AND T+1 ---
+            # --- 3. IDENTIFY TOP 25 VOLUME LEADERS ACROSS T0 AND T+1 ---
             merged["total_event_vol"] = merged["vol_T0"] + merged["vol_T1"]
-            top_volume_candidates = merged.sort_values(by="total_event_vol", ascending=False).head(100)
-            
-            if top_volume_candidates.empty:
-                st.error(f"No volume candidates qualified for {target_auction_date}.")
-                continue
-            
-            # --- 4. VERIFY MARKET CAP ---
-            with st.spinner(f"[{target_auction_date}] Verifying >= ${min_market_cap}M Market Cap on Volume Leaders..."):
-                candidate_tickers = tuple(top_volume_candidates["ticker"].tolist())
-                valid_mc_tickers = get_market_cap_valid_tickers(candidate_tickers, min_market_cap)
-                top_volume_candidates = top_volume_candidates[top_volume_candidates["ticker"].isin(valid_mc_tickers)].copy()
-            
-            # --- 5. ISOLATE STRICTLY THE TOP 25 VOLUME LEADERS ---
-            top_25_leaders = top_volume_candidates.head(25).copy()
+            top_25_leaders = merged.sort_values(by="total_event_vol", ascending=False).head(25).copy()
             
             if top_25_leaders.empty:
-                st.info(f"No optionable market cap leaders found for {target_auction_date}.")
+                st.info(f"No optionable volume leaders found for {target_auction_date}.")
                 continue
                 
-            # --- 6. FETCH THE SMA BASELINE PRIOR TO T0 ---
+            # --- 4. FETCH THE SMA BASELINE PRIOR TO T0 ---
             lookback_days = get_historical_trading_days(t_0_dt, lookback=baseline_lookback)
             
             with st.spinner(f"[{target_auction_date}] Evaluating {baseline_lookback}-day SMA baseline prior to Auction Date..."):
@@ -363,13 +319,13 @@ if not matching_tranches.empty:
                 st.error(f"Historical baseline could not be generated for {target_auction_date}.")
                 continue
                 
-            # --- 7. CALCULATE RVOL ON THE TOP 25 ---
+            # --- 5. CALCULATE RVOL ON THE TOP 25 ---
             merged_final = pd.merge(top_25_leaders, df_base, on="ticker", how="inner")
             
             merged_final["rvol_T0"] = merged_final["vol_T0"] / merged_final["avg_volume_sma"]
             merged_final["rvol_T1"] = merged_final["vol_T1"] / merged_final["avg_volume_sma"]
             
-            # --- 8. APPLY RVOL GATE & DOUBLE SURGE LOGIC ---
+            # --- 6. APPLY RVOL GATE & DOUBLE SURGE LOGIC ---
             merged_final = merged_final[(merged_final["rvol_T0"] >= min_rvol_input) | (merged_final["rvol_T1"] >= min_rvol_input)].copy()
             merged_final["double_surge"] = (merged_final["rvol_T0"] >= min_rvol_input) & (merged_final["rvol_T1"] >= min_rvol_input)
             
