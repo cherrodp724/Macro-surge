@@ -37,9 +37,9 @@ with st.sidebar:
     min_rvol_input = st.slider("Min RVOL Threshold", 1.0, 10.0, 1.5, step=0.1)
     
     baseline_lookback = st.slider(
-        "Volume SMA Lookback (Days)", 
+        "Baseline Volume (Past Sessions)", 
         3, 14, 8, 
-        help="Calculates the baseline prior to T+0. Default is 8 days."
+        help="Averages the raw volume over the specified number of trading sessions immediately prior to T+0. Default is 8."
     )
     
     today = datetime.date.today()
@@ -106,7 +106,7 @@ def get_common_stocks():
         return set()
 
 def get_historical_trading_days(target_date, lookback=8):
-    """Returns business days strictly prior to target_date."""
+    """Returns business sessions strictly prior to target_date."""
     days = []
     curr = target_date - datetime.timedelta(days=1)
     while len(days) < lookback:
@@ -185,13 +185,13 @@ def build_smoothed_baseline(trading_days, api_key):
         return pd.DataFrame()
 
     full_history = pd.concat(dfs, ignore_index=True)
-    return full_history.groupby("ticker")["volume"].mean().reset_index(name="avg_volume_sma")
+    return full_history.groupby("ticker")["volume"].mean().reset_index(name="avg_session_vol")
 
 # -------------------------------------------------------------
 # 3. Main Interface & Execution
 # -------------------------------------------------------------
 st.title("Macro Collateral & Volume Surge Scanner")
-st.caption("Targeting the Top 25 Market Volume Leaders on T+0 (Auction Date) and T+1 (When-Issued / Post-Auction Settlement), filtered for institutional RVOL against an 8-day SMA.")
+st.caption("Targeting the Top 25 Market Volume Leaders on T+0 (Auction Date) and T+1 (When-Issued / Post-Auction Settlement), filtered for institutional RVOL against the prior 8-session volume average.")
 
 if not api_key_input:
     st.warning("Enter your Massive/Polygon API Key in the sidebar to begin.")
@@ -309,10 +309,10 @@ if not matching_tranches.empty:
                 st.info(f"No optionable volume leaders found for {target_auction_date}.")
                 continue
                 
-            # --- 4. FETCH THE SMA BASELINE PRIOR TO T0 ---
+            # --- 4. FETCH THE VOLUME AVERAGE FOR THE PRIOR SESSIONS ---
             lookback_days = get_historical_trading_days(t_0_dt, lookback=baseline_lookback)
             
-            with st.spinner(f"[{target_auction_date}] Evaluating {baseline_lookback}-day SMA baseline prior to Auction Date..."):
+            with st.spinner(f"[{target_auction_date}] Evaluating {baseline_lookback}-session average volume prior to Auction Date..."):
                 df_base = build_smoothed_baseline(lookback_days, api_key_input)
                 
             if df_base.empty:
@@ -322,8 +322,8 @@ if not matching_tranches.empty:
             # --- 5. CALCULATE RVOL ON THE TOP 25 ---
             merged_final = pd.merge(top_25_leaders, df_base, on="ticker", how="inner")
             
-            merged_final["rvol_T0"] = merged_final["vol_T0"] / merged_final["avg_volume_sma"]
-            merged_final["rvol_T1"] = merged_final["vol_T1"] / merged_final["avg_volume_sma"]
+            merged_final["rvol_T0"] = merged_final["vol_T0"] / merged_final["avg_session_vol"]
+            merged_final["rvol_T1"] = merged_final["vol_T1"] / merged_final["avg_session_vol"]
             
             # --- 6. APPLY RVOL GATE & DOUBLE SURGE LOGIC ---
             merged_final = merged_final[(merged_final["rvol_T0"] >= min_rvol_input) | (merged_final["rvol_T1"] >= min_rvol_input)].copy()
@@ -346,14 +346,14 @@ if not matching_tranches.empty:
                 out["Type"] = np.where(out["double_surge"], "🔥 DOUBLE SURGE", "Single Spike")
                 out["vol_T0"] = out["vol_T0"].apply(lambda x: f"{x:,.0f}")
                 out["vol_T1"] = out["vol_T1"].apply(lambda x: f"{x:,.0f}")
-                out["avg_vol"] = out["avg_volume_sma"].apply(lambda x: f"{x:,.0f}")
+                out["avg_session_vol"] = out["avg_session_vol"].apply(lambda x: f"{x:,.0f}")
                 out["rvol_T0"] = out["rvol_T0"].apply(lambda x: f"{x:.2f}x")
                 out["rvol_T1"] = out["rvol_T1"].apply(lambda x: f"{x:.2f}x")
                 out["surge_score"] = out["surge_score"].apply(lambda x: f"{x:.2f}")
                 out["close_T1"] = out["close_T1"].apply(lambda x: f"${x:.2f}")
                 
                 st.dataframe(
-                    out[["ticker", "Type", "close_T1", "avg_vol", "vol_T0", "rvol_T0", "vol_T1", "rvol_T1", "surge_score"]],
+                    out[["ticker", "Type", "close_T1", "avg_session_vol", "vol_T0", "rvol_T0", "vol_T1", "rvol_T1", "surge_score"]],
                     use_container_width=True
                 )
             else:
